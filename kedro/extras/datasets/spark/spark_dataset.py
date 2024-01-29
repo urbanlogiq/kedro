@@ -1,28 +1,17 @@
 """``AbstractVersionedDataSet`` implementation to access Spark dataframes using
 ``pyspark``
 """
-import json
 from copy import deepcopy
 from fnmatch import fnmatch
 from functools import partial
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 from warnings import warn
-
-import fsspec
 from hdfs import HdfsError, InsecureClient
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.types import StructType
 from pyspark.sql.utils import AnalysisException
-from s3fs import S3FileSystem
 
-from kedro.io.core import (
-    AbstractVersionedDataSet,
-    DataSetError,
-    Version,
-    get_filepath_str,
-    get_protocol_and_path,
-)
+from kedro.io.core import AbstractVersionedDataSet, DataSetError, Version
 
 
 def _parse_glob_pattern(pattern: str) -> str:
@@ -100,9 +89,11 @@ def _dbfs_exists(pattern: str, dbutils: Any) -> bool:
     It is assumed that version paths are managed by Kedro.
     Broad `Exception` is present due to `dbutils.fs.ExecutionError` that
     cannot be imported directly.
+
     Args:
         pattern: Filepath to search for.
         dbutils: dbutils instance to operate with DBFS.
+
     Returns:
         Boolean value if filepath exists.
     """
@@ -117,7 +108,8 @@ def _dbfs_exists(pattern: str, dbutils: Any) -> bool:
 
 class KedroHdfsInsecureClient(InsecureClient):
     """Subclasses ``hdfs.InsecureClient`` and implements ``hdfs_exists``
-    and ``hdfs_glob`` methods required by ``SparkDataSet``"""
+    and ``hdfs_glob`` methods required by ``SparkDataSet``
+    """
 
     def hdfs_exists(self, hdfs_path: str) -> bool:
         """Determines whether given ``hdfs_path`` exists in HDFS.
@@ -157,7 +149,7 @@ class KedroHdfsInsecureClient(InsecureClient):
         return sorted(matched)
 
 
-class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
+class SparkDataSet(AbstractVersionedDataSet):
     """``SparkDataSet`` loads and saves Spark dataframes.
 
     Example adding a catalog entry with
@@ -173,18 +165,6 @@ class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
         >>>   load_args:
         >>>     header: True
         >>>     inferSchema: True
-        >>>   save_args:
-        >>>     sep: '|'
-        >>>     header: True
-        >>>
-        >>> weather_schema:
-        >>>   type: spark.SparkDataSet
-        >>>   filepath: s3a://your_bucket/data/01_raw/weather/*
-        >>>   file_format: csv
-        >>>   load_args:
-        >>>     header: True
-        >>>     schema:
-        >>>       filepath: path/to/schema.json
         >>>   save_args:
         >>>     sep: '|'
         >>>     header: True
@@ -230,6 +210,7 @@ class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
         self,
         filepath: str,
         file_format: str = "parquet",
+        generic_load_args: Dict[str, Any] = None,
         load_args: Dict[str, Any] = None,
         save_args: Dict[str, Any] = None,
         version: Version = None,
@@ -247,18 +228,20 @@ class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
                 SparkContext include parquet, csv, delta. For a list of supported
                 formats please refer to Apache Spark documentation at
                 https://spark.apache.org/docs/latest/sql-programming-guide.html
+            generic_load_args: Arguments to pass to the generic Spark write method.
+                See: https://spark.apache.org/docs/latest/sql-data-sources-generic-options.html#generic-file-source-options
             load_args: Load args passed to Spark DataFrameReader load method.
                 It is dependent on the selected file format. You can find
                 a list of read options for each supported format
                 in Spark DataFrame read documentation:
-                https://spark.apache.org/docs/latest/api/python/getting_started/quickstart_df.html
+                https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql.html#dataframe-apis
             save_args: Save args passed to Spark DataFrame write options.
                 Similar to load_args this is dependent on the selected file
                 format. You can pass ``mode`` and ``partitionBy`` to specify
                 your overwrite mode and partitioning respectively. You can find
                 a list of options for each format in Spark DataFrame
                 write documentation:
-                https://spark.apache.org/docs/latest/api/python/getting_started/quickstart_df.html
+                https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql.html#dataframe-apis
             version: If specified, should be an instance of
                 ``kedro.io.core.Version``. If its ``load`` attribute is
                 None, the latest version will be loaded. If its ``save``
@@ -272,23 +255,11 @@ class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
         fs_prefix, filepath = _split_filepath(filepath)
         exists_function = None
         glob_function = None
-
-        if fs_prefix in ("s3a://", "s3n://"):
-            if fs_prefix == "s3n://":
-                warn(
-                    "'s3n' filesystem has now been deprecated by Spark, "
-                    "please consider switching to 's3a'",
-                    DeprecationWarning,
-                )
-            _s3 = S3FileSystem(**credentials)
-            exists_function = _s3.exists
-            glob_function = partial(_s3.glob, refresh=True)
-            path = PurePosixPath(filepath)
-
-        elif fs_prefix == "hdfs://" and version:
+        self._generic_load_args = {}
+        if fs_prefix == "hdfs://" and version:
             warn(
                 f"HDFS filesystem support for versioned {self.__class__.__name__} is "
-                f"in beta and uses 'hdfs.client.InsecureClient', please use with "
+                f"in beta and uses `hdfs.client.InsecureClient`, please use with "
                 f"caution"
             )
 
@@ -324,43 +295,12 @@ class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
         self._save_args = deepcopy(self.DEFAULT_SAVE_ARGS)
         if save_args is not None:
             self._save_args.update(save_args)
-
-        # Handle schema load argument
-        self._schema = self._load_args.pop("schema", None)
-        if self._schema is not None:
-            if isinstance(self._schema, dict):
-                self._schema = self._load_schema_from_file(self._schema)
-
+        if generic_load_args is not None:
+            self._generic_load_args.update(generic_load_args)
         self._file_format = file_format
         self._fs_prefix = fs_prefix
+
         self._handle_delta_format()
-
-    @staticmethod
-    def _load_schema_from_file(schema: Dict[str, Any]) -> StructType:
-
-        filepath = schema.get("filepath")
-        if not filepath:
-            raise DataSetError(
-                "Schema load argument does not specify a 'filepath' attribute. Please"
-                "include a path to a JSON-serialised 'pyspark.sql.types.StructType'."
-            )
-
-        credentials = deepcopy(schema.get("credentials")) or {}
-        protocol, schema_path = get_protocol_and_path(filepath)
-        file_system = fsspec.filesystem(protocol, **credentials)
-        pure_posix_path = PurePosixPath(schema_path)
-        load_path = get_filepath_str(pure_posix_path, protocol)
-
-        # Open schema file
-        with file_system.open(load_path) as fs_file:
-
-            try:
-                return StructType.fromJson(json.loads(fs_file.read()))
-            except Exception as exc:
-                raise DataSetError(
-                    f"Contents of 'schema.filepath' ({schema_path}) are invalid. Please"
-                    f"provide a valid JSON-serialised 'pyspark.sql.types.StructType'."
-                ) from exc
 
     def _describe(self) -> Dict[str, Any]:
         return dict(
@@ -377,13 +317,10 @@ class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
 
     def _load(self) -> DataFrame:
         load_path = _strip_dbfs_prefix(self._fs_prefix + str(self._get_load_path()))
-        read_obj = self._get_spark().read
 
-        # Pass schema if defined
-        if self._schema:
-            read_obj = read_obj.schema(self._schema)
-
-        return read_obj.load(load_path, self._file_format, **self._load_args)
+        return self._get_spark().read.load(
+            load_path, self._file_format, **self._load_args, **self._generic_load_args
+        )
 
     def _save(self, data: DataFrame) -> None:
         save_path = _strip_dbfs_prefix(self._fs_prefix + str(self._get_save_path()))
@@ -412,7 +349,7 @@ class SparkDataSet(AbstractVersionedDataSet[DataFrame, DataFrame]):
             and write_mode not in supported_modes
         ):
             raise DataSetError(
-                f"It is not possible to perform 'save()' for file format 'delta' "
-                f"with mode '{write_mode}' on 'SparkDataSet'. "
-                f"Please use 'spark.DeltaTableDataSet' instead."
+                f"It is not possible to perform `save()` for file format `delta` "
+                f"with mode `{write_mode}` on `SparkDataSet`. "
+                f"Please use `spark.DeltaTableDataSet` instead."
             )
